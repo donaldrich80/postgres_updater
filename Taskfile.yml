@@ -1,0 +1,43 @@
+version: "3"
+
+tasks:
+  venv:
+    desc: Create local virtual environment (.venv)
+    cmds:
+      - python3 -m venv .venv
+
+  install:
+    desc: Install runtime dependencies into .venv
+    deps: [venv]
+    cmds:
+      - .venv/bin/pip install -r requirements.txt
+
+  run:
+    desc: Run replication using data/config.toml
+    deps: [install]
+    cmds:
+      - PYTHONPATH=src .venv/bin/python -m postgres_updater.cli --config data/config.toml
+
+  preflight:
+    desc: Run preflight checks using data/config.toml
+    deps: [install]
+    cmds:
+      - PYTHONPATH=src .venv/bin/python -m postgres_updater.cli preflight --config data/config.toml
+
+  verify:
+    desc: Run verification only using data/config.toml (no migration)
+    deps: [install]
+    cmds:
+      - PYTHONPATH=src .venv/bin/python -m postgres_updater.cli verify --config data/config.toml
+
+  auth-fix:
+    desc: Auto-repair cutover auth mismatch (SCRAM hba rule with MD5 role hashes)
+    deps: [install]
+    cmds:
+      - PYTHONPATH=src .venv/bin/python -m postgres_updater.auth_fix --config data/config.toml
+
+  harden-auth:
+    desc: Convert MD5 role hashes to SCRAM and enforce SCRAM pg_hba rule
+    deps: [install]
+    cmds:
+      - PYTHONPATH=src .venv/bin/python -m postgres_updater.harden_auth --config data/config.toml --password-map data/role_passwords.toml

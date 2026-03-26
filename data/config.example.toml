@@ -1,0 +1,33 @@
+[source]
+# Option 1: DSN string
+# dsn = "postgresql://old_user:old_password@127.0.0.1:5432/old_db"
+
+# Option 2: discrete connection fields
+host = "127.0.0.1"
+port = 5432
+database = "old_db"
+user = "old_user"
+password = "old_password"
+sslmode = "prefer"
+
+[target]
+# Option 1: DSN string
+# dsn = "postgresql://new_user:new_password@127.0.0.1:5433/new_db"
+
+# Option 2: discrete connection fields
+host = "127.0.0.1"
+port = 5433
+database = "new_db"
+user = "new_user"
+password = "new_password"
+sslmode = "prefer"
+
+[migration]
+scope = "server" # "server" or "database"
+engine = "pg_dump" # "pg_dump" (recommended) or "table_copy"
+replicate_globals = true
+batch_size = 5000
+skip_truncate = false
+verify = true
+include = [] # table_copy engine only
+exclude = [] # table_copy engine only
