@@ -5,7 +5,8 @@ Notes for coding agents. `CLAUDE.md` imports this file, so Claude Code and Codex
 - **What it is:** a Python CLI that replicates a PostgreSQL server/database onto a newer
   version and verifies parity, plus two post-cutover auth repair tools. Spec, doors, exit
   codes and the permanent event-code table: `docs/spec.md`.
-- **Layout:** `src/postgres_updater/` (code: `cli.py`, `auth_fix.py`, `harden_auth.py`),
+- **Layout:** `src/postgres_updater/` (code: `cli.py`, `auth_fix.py`, `harden_auth.py`, shared
+  `auth_common.py`),
   `tests/` (offline pytest suite), `docs/`, `data/*.example.toml`, `Taskfile.yml`.
 - **Test command** (must pass before any commit; do not edit `.test-command`):
   `uv run --no-project --python 3.12 --with-requirements requirements-dev.txt pytest -rs`

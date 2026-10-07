@@ -92,8 +92,9 @@ No generated or vendored files exist in the repo.
 
 ## Backlog
 
-- auth_fix/harden_auth duplicate `log`/`build_dsn`/`load_dsns`/`pick_live_dsn`; extract a
-  shared module once a refactor stage is scheduled.
+- Both auth tools run `CREATE EXTENSION adminpack` to read/write pg_hba.conf; PostgreSQL 17
+  removed adminpack (17 release notes), so they cannot patch pg_hba on a 17+ server, and an
+  adminpack left installed on a source breaks restore onto 17+. Needs a replacement path.
 - Decide whether the auth tools should catch their `RuntimeError`s and exit 1 with a coded
   ERROR line like the CLI (behaviour change — needs its own failing test first).
 - Backup filenames still carry a `bak_codex_` prefix from the original author tooling.

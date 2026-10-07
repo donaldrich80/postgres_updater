@@ -248,9 +248,15 @@ class ScriptedCursor:
         return self.last[0]
 
 
+class FakePgconn:
+    def encrypt_password(self, passwd: bytes, user: bytes, algorithm: bytes) -> bytes:
+        return b"SCRAM-SHA-256$4096:fake"
+
+
 class ScriptedConnection:
     def __init__(self, answers: dict[str, list[tuple]]) -> None:
         self.cursor_obj = ScriptedCursor(answers)
+        self.pgconn = FakePgconn()
 
     def __enter__(self) -> "ScriptedConnection":
         return self

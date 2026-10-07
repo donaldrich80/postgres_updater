@@ -655,15 +655,18 @@ def run_command(cmd: list[str], context: str) -> None:
     if completed.returncode == 0:
         return
 
-    stderr = (completed.stderr or "").strip()
-    stdout = (completed.stdout or "").strip()
-    snippets: list[str] = []
-    if stderr:
-        snippets.append(stderr.splitlines()[-1])
-    if stdout:
-        snippets.append(stdout.splitlines()[-1])
-    detail = " | ".join(snippets) if snippets else "no output captured"
     # Error path: non-zero tool exit escapes as CodedError -> main() logs E09, exit 1.
+    raise_tool_failure(context, completed)
+
+
+def raise_tool_failure(context: str, completed: subprocess.CompletedProcess[str]) -> None:
+    """Raise E09 quoting the last stderr and stdout lines of a failed tool run."""
+    snippets = [
+        text.strip().splitlines()[-1]
+        for text in (completed.stderr, completed.stdout)
+        if text and text.strip()
+    ]
+    detail = " | ".join(snippets) if snippets else "no output captured"
     raise CodedError("E09", f"{context} failed with exit code {completed.returncode}: {detail}")
 
 
@@ -1058,7 +1061,11 @@ def sync_table_sequences(target_conn: psycopg.Connection, table: TableSpec) -> i
     updated = 0
     for column_name in table.columns:
         with target_conn.cursor() as cur:
-            cur.execute("SELECT pg_get_serial_sequence(%s, %s)", (table.fq_name, column_name))
+            # The table argument is parsed as an SQL name, so quote each part to keep its case.
+            cur.execute(
+                "SELECT pg_get_serial_sequence(quote_ident(%s) || '.' || quote_ident(%s), %s)",
+                (table.schema, table.name, column_name),
+            )
             sequence_name = cur.fetchone()[0]
         if not sequence_name:
             continue
@@ -1212,6 +1219,19 @@ def verify_tables(
     return mismatches
 
 
+def report_table_mismatches(database_name: str, mismatches: list[str]) -> bool:
+    """Log table verification results (E14 with up to 30 details, or S02); True if any differ."""
+    if not mismatches:
+        db_log(database_name, "Verification passed for all migrated tables.", "S02")
+        return False
+    db_log(database_name, f"Verification failed: {len(mismatches)} table(s) differ.", "E14")
+    for detail in mismatches[:30]:
+        db_log(database_name, f"  - {detail}")
+    if len(mismatches) > 30:
+        db_log(database_name, f"  - ... plus {len(mismatches) - 30} more mismatch(es)")
+    return True
+
+
 def fetch_signature_set(conn: psycopg.Connection, query: str) -> set[str]:
     with conn.cursor() as cur:
         cur.execute(query)
@@ -1338,6 +1358,25 @@ def verify_global_signatures(
     return role_errors + ts_errors, role_warnings + ts_warnings
 
 
+def global_parity_ok(
+    source_admin_conn: psycopg.Connection,
+    target_admin_conn: psycopg.Connection,
+) -> bool:
+    """Compare roles/tablespaces and log the outcome (warnings, E11 on failure)."""
+    global_errors, global_warnings = verify_global_signatures(source_admin_conn, target_admin_conn)
+    if global_warnings:
+        log(f"Global parity warnings: {len(global_warnings)} issue(s).")
+        for issue in global_warnings:
+            log(f"  - {issue}")
+    if global_errors:
+        log(f"Global parity failed: {len(global_errors)} issue(s).", "E11")
+        for issue in global_errors:
+            log(f"  - {issue}")
+        return False
+    log("Global parity passed (roles/tablespaces).")
+    return True
+
+
 def migrate_database(
     args: argparse.Namespace,
     policy: MigrationPolicy,
@@ -1436,14 +1475,8 @@ def migrate_database(
                 verify_progress = ProgressBar(f"[db:{database_name}] Verify", len(source_tables))
                 mismatches = verify_tables(source_conn, target_conn, source_tables, progress=verify_progress)
                 verify_progress.finish("verify complete")
-                if mismatches:
-                    db_log(database_name, f"Verification failed: {len(mismatches)} table(s) differ.", "E14")
-                    for detail in mismatches[:30]:
-                        db_log(database_name, f"  - {detail}")
-                    if len(mismatches) > 30:
-                        db_log(database_name, f"  - ... plus {len(mismatches) - 30} more mismatch(es)")
+                if report_table_mismatches(database_name, mismatches):
                     return 2
-                db_log(database_name, "Verification passed for all migrated tables.", "S02")
 
     return 0
 
@@ -1455,10 +1488,6 @@ def verify_database_after_restore(
     target_dsn: str,
     database_name: str,
 ) -> int:
-    if args.no_verify:
-        db_log(database_name, "Verification skipped (--no-verify).")
-        return 0
-
     with psycopg.connect(source_dsn) as source_conn, psycopg.connect(target_dsn) as target_conn:
         source_conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         target_conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -1478,10 +1507,6 @@ def verify_database_after_restore_with_connections(
     target_conn: psycopg.Connection,
     database_name: str,
 ) -> int:
-    if args.no_verify:
-        db_log(database_name, "Verification skipped (--no-verify).")
-        return 0
-
     db_log(database_name, "Checking schema/object parity.")
     object_errors, object_warnings = verify_database_object_signatures(source_conn, target_conn)
     if object_warnings:
@@ -1508,15 +1533,7 @@ def verify_database_after_restore_with_connections(
     verify_progress = ProgressBar(f"[db:{database_name}] Verify", len(source_tables))
     mismatches = verify_tables(source_conn, target_conn, source_tables, progress=verify_progress)
     verify_progress.finish("verify complete")
-    if mismatches:
-        db_log(database_name, f"Verification failed: {len(mismatches)} table(s) differ.", "E14")
-        for detail in mismatches[:30]:
-            db_log(database_name, f"  - {detail}")
-        if len(mismatches) > 30:
-            db_log(database_name, f"  - ... plus {len(mismatches) - 30} more mismatch(es)")
-        return 2
-    db_log(database_name, "Verification passed for all migrated tables.", "S02")
-    return 0
+    return 2 if report_table_mismatches(database_name, mismatches) else 0
 
 
 def replicate_globals_with_pg_dumpall(source_admin_dsn: str, target_admin_dsn: str, temp_dir: Path) -> None:
@@ -1549,10 +1566,7 @@ def replicate_globals_with_pg_dumpall(source_admin_dsn: str, target_admin_dsn: s
         capture_output=True,
     )
     if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        stdout = (completed.stdout or "").strip()
-        detail = " | ".join(line for line in [stderr.splitlines()[-1] if stderr else "", stdout.splitlines()[-1] if stdout else ""] if line)
-        raise CodedError("E09", f"Importing global objects failed with exit code {completed.returncode}: {detail or 'no output captured'}")
+        raise_tool_failure("Importing global objects", completed)
 
     stderr_text = completed.stderr or ""
     if "already exists" in stderr_text:
@@ -1605,6 +1619,10 @@ def replicate_database_with_pg_dump(
             f"[db:{database_name}] pg_restore",
         )
 
+        if args.no_verify:
+            db_log(database_name, "Verification skipped (--no-verify).")
+            return 0
+
         with psycopg.connect(target_dsn) as target_conn:
             target_conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             return verify_database_after_restore_with_connections(
@@ -1616,6 +1634,15 @@ def replicate_database_with_pg_dump(
             )
 
 
+def database_scope_name(args: argparse.Namespace) -> str:
+    """Source database name for --scope database; warns when the target's name differs."""
+    source_dbname = dsn_database_name(args.source_dsn)
+    target_dbname = dsn_database_name(args.target_dsn)
+    if source_dbname != target_dbname:
+        log(f"Warning: source/target database names differ ({source_dbname} -> {target_dbname}).")
+    return source_dbname
+
+
 def run_table_copy_workflow(
     args: argparse.Namespace,
     policy: MigrationPolicy,
@@ -1623,13 +1650,7 @@ def run_table_copy_workflow(
     target_admin_conn: psycopg.Connection,
 ) -> int:
     if args.scope == "database":
-        source_dbname = dsn_database_name(args.source_dsn)
-        target_dbname = dsn_database_name(args.target_dsn)
-        if source_dbname != target_dbname:
-            log(
-                "Warning: source/target database names differ "
-                f"({source_dbname} -> {target_dbname})."
-            )
+        source_dbname = database_scope_name(args)
         return migrate_database(args, policy, args.source_dsn, args.target_dsn, source_dbname)
 
     source_databases = list_source_databases(source_admin_conn)
@@ -1639,7 +1660,6 @@ def run_table_copy_workflow(
 
     log(f"Server scope selected. Found {len(source_databases)} source database(s).")
     verification_failed = False
-    result = 0
     db_progress = ProgressBar("[server] Databases", len(source_databases))
 
     # CREATE DATABASE cannot run inside a transaction block.
@@ -1661,16 +1681,11 @@ def run_table_copy_workflow(
         with stage(f"db:{dbname}"):
             db_result = migrate_database(args, policy, db_source_dsn, db_target_dsn, dbname)
         db_progress.advance(dbname)
-        if db_result == 1:
-            result = 1
-            break
         if db_result == 2:
             verification_failed = True
 
     db_progress.finish("database pass complete")
-    if result == 0 and verification_failed:
-        result = 2
-    return result
+    return 2 if verification_failed else 0
 
 
 def run_pg_dump_workflow(
@@ -1685,10 +1700,7 @@ def run_pg_dump_workflow(
     require_binaries(required)
 
     if args.scope == "database":
-        dbname = dsn_database_name(args.source_dsn)
-        target_dbname = dsn_database_name(args.target_dsn)
-        if dbname != target_dbname:
-            log(f"Warning: source/target database names differ ({dbname} -> {target_dbname}).")
+        dbname = database_scope_name(args)
         if args.dry_run:
             db_log(dbname, "Dry-run: would perform pg_dump/pg_restore replication.")
             return 0
@@ -1735,7 +1747,6 @@ def run_pg_dump_workflow(
             log("Skipping global object replication (--skip-globals).")
 
         verification_failed = False
-        result = 0
         db_progress = ProgressBar("[server] Databases", len(source_databases))
         for dbname in source_databases:
             if not target_database_exists(target_admin_conn, dbname):
@@ -1754,28 +1765,12 @@ def run_pg_dump_workflow(
                     temp_dir=temp_dir,
                 )
             db_progress.advance(dbname)
-            if db_result == 1:
-                result = 1
-                break
             if db_result == 2:
                 verification_failed = True
         db_progress.finish("database pass complete")
-        if not args.skip_globals:
-            global_errors, global_warnings = verify_global_signatures(source_admin_conn, target_admin_conn)
-            if global_warnings:
-                log(f"Global parity warnings: {len(global_warnings)} issue(s).")
-                for issue in global_warnings:
-                    log(f"  - {issue}")
-            if global_errors:
-                log(f"Global parity failed: {len(global_errors)} issue(s).", "E11")
-                for issue in global_errors:
-                    log(f"  - {issue}")
-                verification_failed = True
-            else:
-                log("Global parity passed (roles/tablespaces).")
-        if result == 0 and verification_failed:
-            result = 2
-        return result
+        if not args.skip_globals and not global_parity_ok(source_admin_conn, target_admin_conn):
+            verification_failed = True
+        return 2 if verification_failed else 0
 
 
 def run_preflight(
@@ -1850,10 +1845,7 @@ def run_verify_only(
     target_admin_conn: psycopg.Connection,
 ) -> int:
     if args.scope == "database":
-        dbname = dsn_database_name(args.source_dsn)
-        target_dbname = dsn_database_name(args.target_dsn)
-        if dbname != target_dbname:
-            log(f"Warning: source/target database names differ ({dbname} -> {target_dbname}).")
+        dbname = database_scope_name(args)
         return verify_database_after_restore(args, policy, args.source_dsn, args.target_dsn, dbname)
 
     source_databases = list_source_databases(source_admin_conn)
@@ -1861,23 +1853,13 @@ def run_verify_only(
         log("No source databases found.")
         return 0
 
-    global_errors, global_warnings = verify_global_signatures(source_admin_conn, target_admin_conn)
-    if global_warnings:
-        log(f"Global parity warnings: {len(global_warnings)} issue(s).")
-        for issue in global_warnings:
-            log(f"  - {issue}")
-    if global_errors:
-        log(f"Global parity failed: {len(global_errors)} issue(s).", "E11")
-        for issue in global_errors:
-            log(f"  - {issue}")
+    if not global_parity_ok(source_admin_conn, target_admin_conn):
         return 2
-    log("Global parity passed (roles/tablespaces).")
 
     target_databases = set(list_target_databases(target_admin_conn))
     log(f"Server scope selected. Found {len(source_databases)} source database(s).")
 
     verification_failed = False
-    result = 0
     db_progress = ProgressBar("[server] Verify DBs", len(source_databases))
 
     for dbname in source_databases:
@@ -1891,16 +1873,11 @@ def run_verify_only(
         db_target_dsn = dsn_with_database(args.target_dsn, dbname)
         db_result = verify_database_after_restore(args, policy, db_source_dsn, db_target_dsn, dbname)
         db_progress.advance(dbname)
-        if db_result == 1:
-            result = 1
-            break
         if db_result == 2:
             verification_failed = True
 
     db_progress.finish("verification pass complete")
-    if result == 0 and verification_failed:
-        result = 2
-    return result
+    return 2 if verification_failed else 0
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1936,27 +1913,21 @@ def run(args: argparse.Namespace) -> int:
                 "Copy continues, but feature mismatches can fail at runtime."
             )
 
-        # Branch: preflight and verify are read-only and return early; run mutates the target.
+        # Branch: preflight and verify are read-only; run mutates the target.
         if args.command == "preflight":
             with stage("preflight"):
                 result = run_preflight(args, policy, source_admin_conn, target_admin_conn)
-            elapsed_total = time.time() - start_time
-            log(f"Done in {elapsed_total:.2f}s.")
-            return result
-        if args.command == "verify":
+        elif args.command == "verify":
             with stage("verify"):
                 result = run_verify_only(args, policy, source_admin_conn, target_admin_conn)
-            elapsed_total = time.time() - start_time
-            log(f"Done in {elapsed_total:.2f}s.")
-            return result
-
-        # Branch: table_copy is the partial fallback; pg_dump (default) replicates all objects.
-        log(f"Using replication engine: {args.engine}.")
-        with stage(f"replicate:{args.engine}"):
-            if args.engine == "table_copy":
-                result = run_table_copy_workflow(args, policy, source_admin_conn, target_admin_conn)
-            else:
-                result = run_pg_dump_workflow(args, policy, source_admin_conn, target_admin_conn)
+        else:
+            # Branch: table_copy is the partial fallback; pg_dump (default) replicates all objects.
+            log(f"Using replication engine: {args.engine}.")
+            with stage(f"replicate:{args.engine}"):
+                if args.engine == "table_copy":
+                    result = run_table_copy_workflow(args, policy, source_admin_conn, target_admin_conn)
+                else:
+                    result = run_pg_dump_workflow(args, policy, source_admin_conn, target_admin_conn)
 
     elapsed_total = time.time() - start_time
     log(f"Done in {elapsed_total:.2f}s.")

@@ -18,70 +18,23 @@ Flow:
 from __future__ import annotations
 
 import argparse
-import re
-import time
-from datetime import datetime
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+from postgres_updater.auth_common import (
+    build_dsn,
+    connect_live,
+    fetch_md5_roles,
+    load_dsns,
+    log,
+    patch_hba_method,
+    run_with_summary,
+    tomllib,
+)
 
-
-# Event codes seen during this process, in order; reported by the RUN SUMMARY line.
-# Codes are permanent: never renumber or reuse one (table in docs/spec.md).
-RUN_EVENTS: list[str] = []
-
-
-def log(message: str, code: str | None = None) -> None:
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if code:
-        RUN_EVENTS.append(code)
-        message = f"[{code}] {message}"
-    print(f"[{stamp}] {message}", flush=True)
-
-
-def build_dsn(section: dict[str, object]) -> str:
-    if "dsn" in section and isinstance(section["dsn"], str):
-        return section["dsn"]
-    host = str(section.get("host", "127.0.0.1"))
-    port = int(section.get("port", 5432))
-    database = str(section.get("database", "postgres"))
-    user = str(section.get("user", "postgres"))
-    password = str(section.get("password", ""))
-    sslmode = str(section.get("sslmode", "prefer"))
-    return (
-        f"host={host} port={port} dbname={database} user={user} "
-        f"password={password} sslmode={sslmode}"
-    )
-
-
-def load_dsns(config_path: Path) -> list[tuple[str, str]]:
-    config = tomllib.loads(config_path.read_text())
-    source = config.get("source", {})
-    target = config.get("target", {})
-    dsns: list[tuple[str, str]] = []
-    if isinstance(source, dict):
-        dsns.append(("source", build_dsn(source)))
-    if isinstance(target, dict):
-        dsns.append(("target", build_dsn(target)))
-    return dsns
-
-
-def pick_live_dsn(candidates: list[tuple[str, str]]) -> tuple[str, str]:
-    errors: list[str] = []
-    for label, dsn in candidates:
-        try:
-            with psycopg.connect(dsn):
-                return label, dsn
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{label}: {exc}")
-    # Error path: no candidate answered; logged with a code, then raised (uncaught, traceback).
-    log("Could not connect to any configured server.", "E31")
-    raise RuntimeError("Could not connect to any configured server: " + " | ".join(errors))
+__all__ = ["build_dsn", "load_dsns", "load_password_map", "main", "toml_key", "write_template"]
 
 
 def toml_key(value: str) -> str:
@@ -111,46 +64,25 @@ def write_template(path: Path, roles: list[str]) -> None:
         "# This file is local-only and should not be committed.",
         "[passwords]",
     ]
-    for role in roles:
-        lines.append(f"{toml_key(role)} = \"\"")
+    # Keep passwords the operator already filled in; only missing roles get a blank entry.
+    existing: dict[str, object] = {}
+    if path.exists():
+        existing = tomllib.loads(path.read_text()).get("passwords", {})
+        if not isinstance(existing, dict):
+            existing = {}
+    for role in [*roles, *(name for name in existing if name not in roles)]:
+        value = existing.get(role, "")
+        lines.append(f"{toml_key(role)} = {toml_key(value if isinstance(value, str) else '')}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n")
 
 
-def fetch_md5_roles(conn: psycopg.Connection) -> list[str]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT rolname
-            FROM pg_authid
-            WHERE rolcanlogin
-              AND rolpassword LIKE 'md5%%'
-            ORDER BY rolname
-            """
-        )
-        return [row[0] for row in cur.fetchall()]
-
-
-def patch_hba_method(conn: psycopg.Connection, from_method: str, to_method: str) -> tuple[bool, str]:
-    with conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS adminpack")
-        cur.execute("SHOW hba_file")
-        hba_file = str(cur.fetchone()[0])
-        cur.execute("SELECT pg_read_file(%s)", (hba_file,))
-        current_hba = str(cur.fetchone()[0])
-        pattern = rf"(?m)^(\s*host\s+all\s+all\s+all\s+){re.escape(from_method)}(\s*(?:#.*)?)$"
-        updated_hba = re.sub(pattern, rf"\1{to_method}\2", current_hba)
-        if updated_hba == current_hba:
-            return False, hba_file
-
-        # External call: writes a backup, replaces pg_hba.conf on the server's disk, reloads config.
-        backup = f"{hba_file}.bak_codex_harden_auth_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        cur.execute("SELECT pg_file_write(%s, %s, false)", (backup, current_hba))
-        cur.execute("SELECT pg_file_unlink(%s)", (hba_file,))
-        cur.execute("SELECT pg_file_write(%s, %s, false)", (hba_file, updated_hba))
-        cur.execute("SELECT pg_reload_conf()")
-        cur.fetchone()
-    return True, backup
+def enforce_scram_rule(conn: psycopg.Connection) -> None:
+    patched = patch_hba_method(conn, "md5", "scram-sha-256", "harden_auth")
+    if patched:
+        log(f"Updated pg_hba host all/all rule to scram-sha-256. Backup: {patched[0]}")
+    else:
+        log("No host all/all md5 rule found to change.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,26 +99,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def _main(args: argparse.Namespace) -> int:
-    config_path = Path(args.config)
     password_map_path = Path(args.password_map)
-    if not config_path.exists():
-        # Error path: missing config is raised uncaught (traceback, exit 1) after a coded log line.
-        log(f"Config file not found: {config_path}", "E30")
-        raise RuntimeError(f"Config file not found: {config_path}")
-
-    # External call: try [source] then [target] DSN; the first that connects is the live server.
-    label, dsn = pick_live_dsn(load_dsns(config_path))
-    log(f"Connected to live server using [{label}] DSN.")
+    dsn = connect_live(Path(args.config), missing_code="E30", unreachable_code="E31")
 
     with psycopg.connect(dsn, autocommit=True) as conn:
         md5_roles = fetch_md5_roles(conn)
         if not md5_roles:
             log("No MD5 login roles found.", "S30")
-            changed, backup = patch_hba_method(conn, "md5", "scram-sha-256")
-            if changed:
-                log(f"Updated pg_hba host all/all rule to scram-sha-256. Backup: {backup}")
-            else:
-                log("No host all/all md5 rule found to change.")
+            enforce_scram_rule(conn)
             return 0
 
         passwords = load_password_map(password_map_path)
@@ -206,7 +126,16 @@ def _main(args: argparse.Namespace) -> int:
             cur.fetchone()
 
             for role in md5_roles:
-                cur.execute(f'ALTER ROLE {toml_key(role)} WITH PASSWORD %s', (passwords[role],))
+                # Hash client-side (as psql's \password does) so plaintext never reaches the
+                # server log; ALTER ROLE takes no bind parameters, so the verifier is a literal.
+                verifier = conn.pgconn.encrypt_password(
+                    passwords[role].encode(), role.encode(), b"scram-sha-256"
+                ).decode()
+                cur.execute(
+                    sql.SQL("ALTER ROLE {} WITH PASSWORD {}").format(
+                        sql.Identifier(role), sql.Literal(verifier)
+                    )
+                )
             log(f"Updated {len(md5_roles)} role password hash(es) to SCRAM.")
 
         remaining_md5 = fetch_md5_roles(conn)
@@ -215,32 +144,14 @@ def _main(args: argparse.Namespace) -> int:
             log(f"Some roles still have MD5 hashes ({len(remaining_md5)}): {sample}", "E33")
             return 2
 
-        changed, backup = patch_hba_method(conn, "md5", "scram-sha-256")
-        if changed:
-            log(f"Updated pg_hba host all/all rule to scram-sha-256. Backup: {backup}")
-        else:
-            log("No host all/all md5 rule found to change.")
-
+        enforce_scram_rule(conn)
         log("Auth hardening complete.", "S31")
     return 0
 
 
 def main() -> int:
     args = parse_args()  # argparse exits (--help, bad flags) happen before the run is timed
-    started = time.monotonic()
-    RUN_EVENTS.clear()
-    exit_code: int | None = None
-    try:
-        exit_code = _main(args)
-        return exit_code
-    finally:
-        # Run summary is logged on every path, including the uncaught RuntimeError ones.
-        state = {0: "ok", 2: "action_required"}.get(exit_code, "error")
-        log(
-            f"RUN SUMMARY tool=harden_auth state={state} exit={exit_code if exit_code is not None else 'raised'} "
-            f"codes={','.join(RUN_EVENTS) or '-'} duration={time.monotonic() - started:.2f}s",
-            "S00" if exit_code == 0 else "E00",
-        )
+    return run_with_summary("harden_auth", _main, args)
 
 
 if __name__ == "__main__":
