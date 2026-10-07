@@ -148,3 +148,13 @@ postgres-updater --skip-globals
 - Extension version drift is treated as: target newer -> warning, target older -> failure.
 - For very large databases, verification can be expensive. Run with `--no-verify` if you need a faster migration pass, then verify later.
 - Progress bars are shown during live run phases (database and table/verification loops).
+
+## Testing
+
+The suite is offline: it never connects to PostgreSQL (the `psycopg` boundary is faked) and ignores `SOURCE_DSN`, `TARGET_DSN`, `POSTGRES_UPDATER_CONFIG` and `data/config.toml`. Run it with:
+
+```bash
+uv run --no-project --python 3.12 --with-requirements requirements-dev.txt pytest -rs
+```
+
+`-rs` prints every skipped test with its reason. Tests live in `tests/`; dev dependencies are in `requirements-dev.txt`.

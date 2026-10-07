@@ -7,3 +7,5 @@ __pycache__/
 /data/config.toml
 /data/role_passwords.toml
 *.egg-info/
+.pytest_cache/
+
