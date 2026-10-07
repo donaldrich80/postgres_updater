@@ -149,6 +149,13 @@ postgres-updater --skip-globals
 - For very large databases, verification can be expensive. Run with `--no-verify` if you need a faster migration pass, then verify later.
 - Progress bars are shown during live run phases (database and table/verification loops).
 
+## Logs and event codes
+
+Every run prints timestamped lines to stdout; failure and outcome lines carry a permanent
+event code (`[E11] Global parity failed…`), long stages log their duration, and the last
+line is a `RUN SUMMARY` with state, exit code, codes seen and total duration. The code
+table, doors and exit codes are in [`docs/spec.md`](docs/spec.md).
+
 ## Testing
 
 The suite is offline: it never connects to PostgreSQL (the `psycopg` boundary is faked) and ignores `SOURCE_DSN`, `TARGET_DSN`, `POSTGRES_UPDATER_CONFIG` and `data/config.toml`. Run it with:

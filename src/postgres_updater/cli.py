@@ -1,6 +1,30 @@
+"""postgres-updater: replicate an older PostgreSQL server/database onto a newer one, then verify.
+
+Purpose: cutover-grade logical replication across major versions, run on demand by an
+operator (no scheduler; see docs/spec.md). Last verified: 2026-10-07 (offline suite).
+
+Flow (`postgres-updater [run|preflight|verify]`):
+  1. parse_args -> resolve_args_from_config: CLI flags > env vars > data/config.toml.
+  2. validate_args: bad flag combinations fail before any connection (E02).
+  3. External call: open admin connections to source and target (E03 on refusal).
+  4. detect_server_version + build_policy: picks same-major or cross-major copy mode.
+  5. Branch on command:
+       preflight -> run_preflight      (tools, CREATEDB/CREATEROLE, missing DBs; E10)
+       verify    -> run_verify_only    (global + per-db parity; E11-E14)
+       run       -> run_pg_dump_workflow (default: pg_dumpall globals, pg_dump/pg_restore
+                    per database, then parity) or run_table_copy_workflow (--engine table_copy).
+  6. main() logs one RUN SUMMARY line: command, state, exit code, event codes, duration.
+
+Named runtime failures raise CodedError: E06 missing tool, E07 version policy,
+E08 incompatible target schema, E09 pg_dump/pg_restore/pg_dumpall/psql failed.
+
+Every coded log line is `[timestamp] [CODE] message`; codes are permanent and listed in
+docs/spec.md. Exit codes: 0 ok, 1 error, 2 verification/parity failure.
+"""
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import fnmatch
 import os
@@ -301,13 +325,55 @@ class ProgressBar:
         print(message, end="", flush=True)
 
 
-def log(message: str) -> None:
+# Event codes seen during this process, in order; reported by the RUN SUMMARY line.
+# Codes are permanent: never renumber or reuse one (table in docs/spec.md).
+RUN_EVENTS: list[str] = []
+
+
+def log(message: str, code: str | None = None) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if code:
+        RUN_EVENTS.append(code)
+        message = f"[{code}] {message}"
     print(f"[{timestamp}] {message}", flush=True)
 
 
-def db_log(database_name: str, message: str) -> None:
-    log(f"[db:{database_name}] {message}")
+def db_log(database_name: str, message: str, code: str | None = None) -> None:
+    log(f"[db:{database_name}] {message}", code)
+
+
+@contextlib.contextmanager
+def stage(name: str):
+    """Log a stage's start and its duration, including when it raises."""
+    start = time.monotonic()
+    log(f"Stage {name}: start.")
+    try:
+        yield
+    finally:
+        log(f"Stage {name}: finished in {time.monotonic() - start:.2f}s.")
+
+
+class CodedError(RuntimeError):
+    """A RuntimeError for a named failure mode; `code` is its permanent event code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def error_code(exc: BaseException) -> str:
+    """Map an exception escaping run() to its permanent failure code."""
+    if isinstance(exc, CodedError):
+        return exc.code
+    if isinstance(exc, ValueError):
+        return "E02"  # invalid arguments or config file
+    if isinstance(exc, psycopg.OperationalError):
+        return "E03"  # could not connect / connection lost
+    if isinstance(exc, psycopg.Error):
+        return "E05"  # SQL error from source or target
+    if isinstance(exc, RuntimeError):
+        return "E04"  # other runtime failure (e.g. unreadable source attributes or fingerprint)
+    return "E01"  # unexpected error
 
 
 def parse_args() -> argparse.Namespace:
@@ -578,6 +644,7 @@ def command_display(cmd: list[str]) -> str:
 
 
 def run_command(cmd: list[str], context: str) -> None:
+    # External call: runs a PostgreSQL CLI tool (pg_dump/pg_restore) with DSNs redacted in the log.
     log(f"{context}: {command_display(cmd)}")
     completed = subprocess.run(
         cmd,
@@ -596,14 +663,15 @@ def run_command(cmd: list[str], context: str) -> None:
     if stdout:
         snippets.append(stdout.splitlines()[-1])
     detail = " | ".join(snippets) if snippets else "no output captured"
-    raise RuntimeError(f"{context} failed with exit code {completed.returncode}: {detail}")
+    # Error path: non-zero tool exit escapes as CodedError -> main() logs E09, exit 1.
+    raise CodedError("E09", f"{context} failed with exit code {completed.returncode}: {detail}")
 
 
 def require_binaries(names: list[str]) -> None:
     missing = [name for name in names if shutil.which(name) is None]
     if missing:
         csv = ", ".join(missing)
-        raise RuntimeError(f"Missing required PostgreSQL CLI tool(s): {csv}")
+        raise CodedError("E06", f"Missing required PostgreSQL CLI tool(s): {csv}")
 
 
 def maintenance_dsn(dsn: str) -> str:
@@ -701,7 +769,8 @@ def detect_server_version(conn: psycopg.Connection) -> ServerVersion:
 
 def build_policy(source: ServerVersion, target: ServerVersion) -> MigrationPolicy:
     if source.major > target.major:
-        raise RuntimeError(
+        raise CodedError(
+            "E07",
             "Target server major version must be >= source major version. "
             f"Got source {source.concise}, target {target.concise}."
         )
@@ -849,14 +918,15 @@ def create_missing_target_table(
     table: TableSpec,
 ) -> None:
     if table.relkind == "p":
-        raise RuntimeError(
+        raise CodedError(
+            "E08",
             f"{table.fq_name}: partitioned table is missing on target. "
             "Create partitioned table structure first."
         )
 
     source_columns = fetch_source_column_definitions(source_conn, table)
     if not source_columns:
-        raise RuntimeError(f"{table.fq_name}: source table has no columns.")
+        raise CodedError("E08", f"{table.fq_name}: source table has no columns.")
 
     with target_conn.cursor() as cur:
         cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(table.schema)))
@@ -877,7 +947,7 @@ def add_missing_target_columns(
         for column_name in missing_columns:
             column = by_name.get(column_name)
             if column is None:
-                raise RuntimeError(f"{table.fq_name}: source definition for column {column_name} not found.")
+                raise CodedError("E08", f"{table.fq_name}: source definition for column {column_name} not found.")
             alter_stmt = sql.SQL("ALTER TABLE {} ADD COLUMN {}").format(
                 table_identifier(table),
                 column_definition_sql(column),
@@ -936,7 +1006,7 @@ def validate_target_schema(
         suffix = ""
         if len(problems) > 30:
             suffix = f"\n  - ... plus {len(problems) - 30} more issue(s)"
-        raise RuntimeError(f"Target schema is incompatible:\n{preview}{suffix}")
+        raise CodedError("E08", f"Target schema is incompatible:\n{preview}{suffix}")
 
 
 def truncate_target_tables(target_conn: psycopg.Connection, tables: list[TableSpec]) -> None:
@@ -1367,13 +1437,13 @@ def migrate_database(
                 mismatches = verify_tables(source_conn, target_conn, source_tables, progress=verify_progress)
                 verify_progress.finish("verify complete")
                 if mismatches:
-                    db_log(database_name, f"Verification failed: {len(mismatches)} table(s) differ.")
+                    db_log(database_name, f"Verification failed: {len(mismatches)} table(s) differ.", "E14")
                     for detail in mismatches[:30]:
                         db_log(database_name, f"  - {detail}")
                     if len(mismatches) > 30:
                         db_log(database_name, f"  - ... plus {len(mismatches) - 30} more mismatch(es)")
                     return 2
-                db_log(database_name, "Verification passed for all migrated tables.")
+                db_log(database_name, "Verification passed for all migrated tables.", "S02")
 
     return 0
 
@@ -1419,7 +1489,7 @@ def verify_database_after_restore_with_connections(
         for issue in object_warnings:
             db_log(database_name, f"  - {issue}")
     if object_errors:
-        db_log(database_name, f"Object parity failed: {len(object_errors)} issue(s).")
+        db_log(database_name, f"Object parity failed: {len(object_errors)} issue(s).", "E13")
         for issue in object_errors:
             db_log(database_name, f"  - {issue}")
         return 2
@@ -1439,13 +1509,13 @@ def verify_database_after_restore_with_connections(
     mismatches = verify_tables(source_conn, target_conn, source_tables, progress=verify_progress)
     verify_progress.finish("verify complete")
     if mismatches:
-        db_log(database_name, f"Verification failed: {len(mismatches)} table(s) differ.")
+        db_log(database_name, f"Verification failed: {len(mismatches)} table(s) differ.", "E14")
         for detail in mismatches[:30]:
             db_log(database_name, f"  - {detail}")
         if len(mismatches) > 30:
             db_log(database_name, f"  - ... plus {len(mismatches) - 30} more mismatch(es)")
         return 2
-    db_log(database_name, "Verification passed for all migrated tables.")
+    db_log(database_name, "Verification passed for all migrated tables.", "S02")
     return 0
 
 
@@ -1464,6 +1534,7 @@ def replicate_globals_with_pg_dumpall(source_admin_dsn: str, target_admin_dsn: s
         ],
         "Exporting global objects",
     )
+    # External call: psql applies the exported roles/tablespaces to the target server.
     log("Importing global objects (non-fatal conflicts like 'already exists' are tolerated).")
     completed = subprocess.run(
         [
@@ -1481,7 +1552,7 @@ def replicate_globals_with_pg_dumpall(source_admin_dsn: str, target_admin_dsn: s
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
         detail = " | ".join(line for line in [stderr.splitlines()[-1] if stderr else "", stdout.splitlines()[-1] if stdout else ""] if line)
-        raise RuntimeError(f"Importing global objects failed with exit code {completed.returncode}: {detail or 'no output captured'}")
+        raise CodedError("E09", f"Importing global objects failed with exit code {completed.returncode}: {detail or 'no output captured'}")
 
     stderr_text = completed.stderr or ""
     if "already exists" in stderr_text:
@@ -1587,7 +1658,8 @@ def run_table_copy_workflow(
 
         db_source_dsn = dsn_with_database(args.source_dsn, dbname)
         db_target_dsn = dsn_with_database(args.target_dsn, dbname)
-        db_result = migrate_database(args, policy, db_source_dsn, db_target_dsn, dbname)
+        with stage(f"db:{dbname}"):
+            db_result = migrate_database(args, policy, db_source_dsn, db_target_dsn, dbname)
         db_progress.advance(dbname)
         if db_result == 1:
             result = 1
@@ -1653,11 +1725,12 @@ def run_pg_dump_workflow(
     with tempfile.TemporaryDirectory(prefix="postgres_updater_") as tmp:
         temp_dir = Path(tmp)
         if not args.skip_globals:
-            replicate_globals_with_pg_dumpall(
-                source_admin_dsn=maintenance_dsn(args.source_dsn),
-                target_admin_dsn=maintenance_dsn(args.target_dsn),
-                temp_dir=temp_dir,
-            )
+            with stage("globals"):
+                replicate_globals_with_pg_dumpall(
+                    source_admin_dsn=maintenance_dsn(args.source_dsn),
+                    target_admin_dsn=maintenance_dsn(args.target_dsn),
+                    temp_dir=temp_dir,
+                )
         else:
             log("Skipping global object replication (--skip-globals).")
 
@@ -1671,14 +1744,15 @@ def run_pg_dump_workflow(
 
             db_source_dsn = dsn_with_database(args.source_dsn, dbname)
             db_target_dsn = dsn_with_database(args.target_dsn, dbname)
-            db_result = replicate_database_with_pg_dump(
-                args=args,
-                policy=policy,
-                source_dsn=db_source_dsn,
-                target_dsn=db_target_dsn,
-                database_name=dbname,
-                temp_dir=temp_dir,
-            )
+            with stage(f"db:{dbname}"):
+                db_result = replicate_database_with_pg_dump(
+                    args=args,
+                    policy=policy,
+                    source_dsn=db_source_dsn,
+                    target_dsn=db_target_dsn,
+                    database_name=dbname,
+                    temp_dir=temp_dir,
+                )
             db_progress.advance(dbname)
             if db_result == 1:
                 result = 1
@@ -1693,7 +1767,7 @@ def run_pg_dump_workflow(
                 for issue in global_warnings:
                     log(f"  - {issue}")
             if global_errors:
-                log(f"Global parity failed: {len(global_errors)} issue(s).")
+                log(f"Global parity failed: {len(global_errors)} issue(s).", "E11")
                 for issue in global_errors:
                     log(f"  - {issue}")
                 verification_failed = True
@@ -1734,7 +1808,8 @@ def run_preflight(
             ok = False
             log(
                 "Preflight FAIL: target is missing database(s) and current user lacks CREATEDB: "
-                + ", ".join(missing[:20])
+                + ", ".join(missing[:20]),
+                "E10",
             )
         elif missing:
             log(f"Preflight: target is missing {len(missing)} database(s); will create during run.")
@@ -1764,7 +1839,7 @@ def run_preflight(
     if not ok:
         return 1
 
-    log("Preflight OK: checks passed.")
+    log("Preflight OK: checks passed.", "S01")
     return 0
 
 
@@ -1792,7 +1867,7 @@ def run_verify_only(
         for issue in global_warnings:
             log(f"  - {issue}")
     if global_errors:
-        log(f"Global parity failed: {len(global_errors)} issue(s).")
+        log(f"Global parity failed: {len(global_errors)} issue(s).", "E11")
         for issue in global_errors:
             log(f"  - {issue}")
         return 2
@@ -1807,7 +1882,7 @@ def run_verify_only(
 
     for dbname in source_databases:
         if dbname not in target_databases:
-            db_log(dbname, "Verification failed: target database is missing.")
+            db_log(dbname, "Verification failed: target database is missing.", "E12")
             verification_failed = True
             db_progress.advance(dbname)
             continue
@@ -1833,6 +1908,7 @@ def run(args: argparse.Namespace) -> int:
     validate_args(args)
 
     start_time = time.time()
+    # External call: admin connections to both servers; a refusal escapes to main() as E03.
     with psycopg.connect(args.source_dsn) as source_admin_conn, psycopg.connect(args.target_dsn) as target_admin_conn:
         if config_exists:
             log(f"Loaded config file: {args.config}")
@@ -1860,35 +1936,59 @@ def run(args: argparse.Namespace) -> int:
                 "Copy continues, but feature mismatches can fail at runtime."
             )
 
+        # Branch: preflight and verify are read-only and return early; run mutates the target.
         if args.command == "preflight":
-            result = run_preflight(args, policy, source_admin_conn, target_admin_conn)
+            with stage("preflight"):
+                result = run_preflight(args, policy, source_admin_conn, target_admin_conn)
             elapsed_total = time.time() - start_time
             log(f"Done in {elapsed_total:.2f}s.")
             return result
         if args.command == "verify":
-            result = run_verify_only(args, policy, source_admin_conn, target_admin_conn)
+            with stage("verify"):
+                result = run_verify_only(args, policy, source_admin_conn, target_admin_conn)
             elapsed_total = time.time() - start_time
             log(f"Done in {elapsed_total:.2f}s.")
             return result
 
+        # Branch: table_copy is the partial fallback; pg_dump (default) replicates all objects.
         log(f"Using replication engine: {args.engine}.")
-        if args.engine == "table_copy":
-            result = run_table_copy_workflow(args, policy, source_admin_conn, target_admin_conn)
-        else:
-            result = run_pg_dump_workflow(args, policy, source_admin_conn, target_admin_conn)
+        with stage(f"replicate:{args.engine}"):
+            if args.engine == "table_copy":
+                result = run_table_copy_workflow(args, policy, source_admin_conn, target_admin_conn)
+            else:
+                result = run_pg_dump_workflow(args, policy, source_admin_conn, target_admin_conn)
 
     elapsed_total = time.time() - start_time
     log(f"Done in {elapsed_total:.2f}s.")
     return result
 
 
+STATE_BY_EXIT = {0: "ok", 1: "error", 2: "verification_failed"}
+
+
+def log_run_summary(command: str, exit_code: int, started: float) -> None:
+    """One greppable line per run: the run summary the operator sees last."""
+    codes = ",".join(RUN_EVENTS) or "-"
+    state = STATE_BY_EXIT.get(exit_code, "error")
+    log(
+        f"RUN SUMMARY command={command} state={state} exit={exit_code} "
+        f"codes={codes} duration={time.monotonic() - started:.2f}s",
+        "S00" if exit_code == 0 else "E00",
+    )
+
+
 def main() -> int:
+    started = time.monotonic()
+    RUN_EVENTS.clear()
     args = parse_args()
     try:
-        return run(args)
+        result = run(args)
     except Exception as exc:
-        log(f"ERROR: {exc}")
-        return 1
+        # Error path: any escaping exception becomes one coded ERROR line and exit 1.
+        log(f"ERROR: {exc}", error_code(exc))
+        result = 1
+    log_run_summary(args.command, result, started)
+    return result
 
 
 if __name__ == "__main__":

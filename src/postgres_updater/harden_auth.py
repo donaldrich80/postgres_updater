@@ -1,7 +1,25 @@
+"""harden_auth: convert MD5 role hashes to SCRAM and enforce SCRAM in pg_hba.
+
+Purpose: the follow-up to auth_fix. Re-sets each MD5 login role's password (from a
+local, gitignored password map) so it is stored as SCRAM, then switches the
+`host all all all md5` rule to scram-sha-256. Run on demand (`task harden-auth`).
+Last verified: 2026-10-07 (offline suite).
+
+Flow:
+  1. Load data/config.toml; missing file -> E30, RuntimeError raised.
+  2. External call: connect to [source] then [target]; none reachable -> E31, raised.
+  3. Read MD5 login roles. Branch: none -> patch pg_hba md5->scram, S30 exit 0.
+  4. Branch: any role missing from the password map -> write a template map, E32 exit 2.
+  5. External call: ALTER SYSTEM password_encryption, reload, ALTER ROLE ... PASSWORD each role.
+  6. Branch: roles still MD5 afterwards -> E33 exit 2.
+  7. External call: patch pg_hba md5->scram (backup first), reload -> S31 exit 0.
+  8. main() logs a RUN SUMMARY line on every path.
+"""
 from __future__ import annotations
 
 import argparse
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -13,8 +31,16 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 
-def log(message: str) -> None:
+# Event codes seen during this process, in order; reported by the RUN SUMMARY line.
+# Codes are permanent: never renumber or reuse one (table in docs/spec.md).
+RUN_EVENTS: list[str] = []
+
+
+def log(message: str, code: str | None = None) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if code:
+        RUN_EVENTS.append(code)
+        message = f"[{code}] {message}"
     print(f"[{stamp}] {message}", flush=True)
 
 
@@ -53,6 +79,8 @@ def pick_live_dsn(candidates: list[tuple[str, str]]) -> tuple[str, str]:
                 return label, dsn
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{label}: {exc}")
+    # Error path: no candidate answered; logged with a code, then raised (uncaught, traceback).
+    log("Could not connect to any configured server.", "E31")
     raise RuntimeError("Could not connect to any configured server: " + " | ".join(errors))
 
 
@@ -115,6 +143,7 @@ def patch_hba_method(conn: psycopg.Connection, from_method: str, to_method: str)
         if updated_hba == current_hba:
             return False, hba_file
 
+        # External call: writes a backup, replaces pg_hba.conf on the server's disk, reloads config.
         backup = f"{hba_file}.bak_codex_harden_auth_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         cur.execute("SELECT pg_file_write(%s, %s, false)", (backup, current_hba))
         cur.execute("SELECT pg_file_unlink(%s)", (hba_file,))
@@ -124,7 +153,7 @@ def patch_hba_method(conn: psycopg.Connection, from_method: str, to_method: str)
     return True, backup
 
 
-def main() -> int:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Harden PostgreSQL auth after cutover: convert MD5 role hashes to SCRAM and enforce SCRAM in pg_hba."
     )
@@ -134,20 +163,25 @@ def main() -> int:
         default="data/role_passwords.toml",
         help="Path to TOML file containing plaintext role passwords under [passwords].",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
 
+
+def _main(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     password_map_path = Path(args.password_map)
     if not config_path.exists():
+        # Error path: missing config is raised uncaught (traceback, exit 1) after a coded log line.
+        log(f"Config file not found: {config_path}", "E30")
         raise RuntimeError(f"Config file not found: {config_path}")
 
+    # External call: try [source] then [target] DSN; the first that connects is the live server.
     label, dsn = pick_live_dsn(load_dsns(config_path))
     log(f"Connected to live server using [{label}] DSN.")
 
     with psycopg.connect(dsn, autocommit=True) as conn:
         md5_roles = fetch_md5_roles(conn)
         if not md5_roles:
-            log("No MD5 login roles found.")
+            log("No MD5 login roles found.", "S30")
             changed, backup = patch_hba_method(conn, "md5", "scram-sha-256")
             if changed:
                 log(f"Updated pg_hba host all/all rule to scram-sha-256. Backup: {backup}")
@@ -157,14 +191,16 @@ def main() -> int:
 
         passwords = load_password_map(password_map_path)
         missing = [role for role in md5_roles if role not in passwords]
+        # Branch: refuse to touch any role until every MD5 role has a password; leave a template to fill.
         if missing:
             write_template(password_map_path, md5_roles)
             sample = ", ".join(missing[:10])
-            log(f"Missing plaintext passwords for {len(missing)} role(s): {sample}")
+            log(f"Missing plaintext passwords for {len(missing)} role(s): {sample}", "E32")
             log(f"Wrote/updated template: {password_map_path}")
             return 2
 
         with conn.cursor() as cur:
+            # External call: changes server config, then rewrites each role's stored password hash.
             cur.execute("ALTER SYSTEM SET password_encryption = 'scram-sha-256'")
             cur.execute("SELECT pg_reload_conf()")
             cur.fetchone()
@@ -176,7 +212,7 @@ def main() -> int:
         remaining_md5 = fetch_md5_roles(conn)
         if remaining_md5:
             sample = ", ".join(remaining_md5[:10])
-            log(f"Some roles still have MD5 hashes ({len(remaining_md5)}): {sample}")
+            log(f"Some roles still have MD5 hashes ({len(remaining_md5)}): {sample}", "E33")
             return 2
 
         changed, backup = patch_hba_method(conn, "md5", "scram-sha-256")
@@ -185,8 +221,26 @@ def main() -> int:
         else:
             log("No host all/all md5 rule found to change.")
 
-        log("Auth hardening complete.")
+        log("Auth hardening complete.", "S31")
     return 0
+
+
+def main() -> int:
+    args = parse_args()  # argparse exits (--help, bad flags) happen before the run is timed
+    started = time.monotonic()
+    RUN_EVENTS.clear()
+    exit_code: int | None = None
+    try:
+        exit_code = _main(args)
+        return exit_code
+    finally:
+        # Run summary is logged on every path, including the uncaught RuntimeError ones.
+        state = {0: "ok", 2: "action_required"}.get(exit_code, "error")
+        log(
+            f"RUN SUMMARY tool=harden_auth state={state} exit={exit_code if exit_code is not None else 'raised'} "
+            f"codes={','.join(RUN_EVENTS) or '-'} duration={time.monotonic() - started:.2f}s",
+            "S00" if exit_code == 0 else "E00",
+        )
 
 
 if __name__ == "__main__":
